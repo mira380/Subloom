@@ -62,7 +62,7 @@ python subloom.py run "https://youtu.be/VIDEO_ID" --ollama
 
 - Improve subtitle timing ⏳
 
-- Flag lines the model is unsure about ⏳
+- Flag lines the model is unsure about 🟡 (rescue is working)
 
 - Smarter LLM checks/intelligence upgrades ⏳
 
