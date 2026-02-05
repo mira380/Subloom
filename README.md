@@ -56,13 +56,13 @@ python subloom.py run "https://youtu.be/VIDEO_ID" --ollama
 
 - Improve audio capturing (more reliable and doesn't randomly cut out and come back at times)
 
-- Put in protections that prevents LLM from changing meaning/nuance and keeps original meaning clear
+- Put in protections that prevents LLM from changing meaning/nuance and keeps original meaning clear ️✅ (should be working)
 
 - Improve subtitle timing
 
 - Flag lines the model is unsure about
 
-- Less clutter when outputting completed files
+- Less clutter when outputting completed files ️✅ 1/2 (need to organize a little better)
 
 ### Target Goal
 
