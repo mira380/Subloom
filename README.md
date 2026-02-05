@@ -58,6 +58,8 @@ python subloom.py run "https://youtu.be/VIDEO_ID" --ollama
 
 - Put in protections that prevents LLM from changing meaning/nuance and keeps original meaning clear ️✅ (should be working)
 
+- Simplify usage of commands/program itself
+
 - Improve subtitle timing
 
 - Flag lines the model is unsure about
