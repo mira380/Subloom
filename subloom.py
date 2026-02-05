@@ -175,7 +175,10 @@ def wav_preflight_ok(
         return False, f"wav too short ({dur:.1f}s < {min_sec:.1f}s)"
 
     if expected_sec and expected_sec > 60 and dur < expected_sec * 0.60:
-        return False, f"wav much shorter than input ({dur:.1f}s vs ~{expected_sec:.1f}s)"
+        return (
+            False,
+            f"wav much shorter than input ({dur:.1f}s vs ~{expected_sec:.1f}s)",
+        )
 
     streams = meta.get("streams") or []
     a0 = next((s for s in streams if s.get("codec_type") == "audio"), None)
@@ -245,7 +248,9 @@ def extract_and_clean_audio(
     ]
     run(cmd_extract, check=True)
 
-    ok, reason = wav_preflight_ok(out_wav, min_sec=min_audio_sec, expected_sec=expected_sec)
+    ok, reason = wav_preflight_ok(
+        out_wav, min_sec=min_audio_sec, expected_sec=expected_sec
+    )
 
     if not ok:
         bad = out_wav.with_suffix(".bad.wav")
@@ -256,7 +261,9 @@ def extract_and_clean_audio(
         except Exception:
             pass
 
-        print(f"[subloom] audio preflight failed ({reason}) — retrying extraction (map {map_sel})")
+        print(
+            f"[subloom] audio preflight failed ({reason}) — retrying extraction (map {map_sel})"
+        )
 
         cmd_extract_fallback = [
             "ffmpeg",
@@ -291,7 +298,9 @@ def extract_and_clean_audio(
         ]
         run(cmd_extract_fallback, check=True)
 
-        ok2, reason2 = wav_preflight_ok(out_wav, min_sec=min_audio_sec, expected_sec=expected_sec)
+        ok2, reason2 = wav_preflight_ok(
+            out_wav, min_sec=min_audio_sec, expected_sec=expected_sec
+        )
         if not ok2:
             raise RuntimeError(
                 "Audio extraction still looks broken after fallback.\n"
@@ -333,6 +342,7 @@ def extract_and_clean_audio(
 # Small basic checks + helpers
 # ----------------------------
 
+
 def have(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
@@ -353,7 +363,9 @@ def ensure_tools() -> None:
         missing.append(f"ggml-large-v3 model ({WCPP_MODEL})")
 
     if missing:
-        raise SystemExit("Missing requirements:\n" + "\n".join(f"- {m}" for m in missing))
+        raise SystemExit(
+            "Missing requirements:\n" + "\n".join(f"- {m}" for m in missing)
+        )
 
 
 def yt_dlp_download(url: str, outdir: Path) -> Path:
@@ -383,7 +395,18 @@ def yt_dlp_download(url: str, outdir: Path) -> Path:
 
 
 def iter_media_files(folder: Path) -> Iterable[Path]:
-    exts = {".mkv", ".mp4", ".webm", ".avi", ".mov", ".m4v", ".mp3", ".flac", ".ogg", ".wav"}
+    exts = {
+        ".mkv",
+        ".mp4",
+        ".webm",
+        ".avi",
+        ".mov",
+        ".m4v",
+        ".mp3",
+        ".flac",
+        ".ogg",
+        ".wav",
+    }
     for p in sorted(folder.rglob("*")):
         if p.is_file() and p.suffix.lower() in exts:
             yield p
@@ -392,6 +415,7 @@ def iter_media_files(folder: Path) -> Iterable[Path]:
 # ----------------------------
 # One-file pipeline
 # ----------------------------
+
 
 def _copy_text_file(src: Path, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -481,7 +505,9 @@ def process_one(input_arg: str, workdir: Path, args) -> None:
         model_path = find_kotoba_ggml_model(KOTOBA_GGML_DIR)
 
     if not model_path:
-        raise RuntimeError(f"No Kotoba GGML .bin found in {KOTOBA_GGML_DIR} (or pass --kotoba-ggml)")
+        raise RuntimeError(
+            f"No Kotoba GGML .bin found in {KOTOBA_GGML_DIR} (or pass --kotoba-ggml)"
+        )
 
     if args.resume and kotoba_json.exists():
         print("[2/3] kotoba check (resume)")
@@ -532,12 +558,17 @@ def process_one(input_arg: str, workdir: Path, args) -> None:
     mins = int(dt // 60)
     secs = dt % 60
     print(f"[subloom] Done: {final_srt}")
-    print(f"[subloom] Finished in {mins}m {secs:.1f}s" if mins else f"[subloom] Finished in {secs:.1f}s")
+    print(
+        f"[subloom] Finished in {mins}m {secs:.1f}s"
+        if mins
+        else f"[subloom] Finished in {secs:.1f}s"
+    )
 
 
 # ----------------------------
 # CLI
 # ----------------------------
+
 
 def main() -> None:
     ap = argparse.ArgumentParser(
@@ -547,24 +578,69 @@ def main() -> None:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def add_common(p: argparse.ArgumentParser) -> None:
-        p.add_argument("--workdir", default=str(DEFAULT_WORKDIR), help="where URL downloads go")
-        p.add_argument("--kotoba-ggml", default=None, help=f"Path to Kotoba GGML .bin (default auto from {KOTOBA_GGML_DIR})")
-        p.add_argument("--resume", action="store_true", help="Skip whisper/kotoba runs if outputs already exist")
+        p.add_argument(
+            "--workdir", default=str(DEFAULT_WORKDIR), help="where URL downloads go"
+        )
+        p.add_argument(
+            "--kotoba-ggml",
+            default=None,
+            help=f"Path to Kotoba GGML .bin (default auto from {KOTOBA_GGML_DIR})",
+        )
+        p.add_argument(
+            "--resume",
+            action="store_true",
+            help="Skip whisper/kotoba runs if outputs already exist",
+        )
         p.add_argument("--keep-wav", action="store_true", help="Keep extracted WAVs")
-        p.add_argument("--no-clean", action="store_true", help="Skip ffmpeg filter pass")
-        p.add_argument("--compare-log", action="store_true", help="Write compare/debug log")
+        p.add_argument(
+            "--no-clean", action="store_true", help="Skip ffmpeg filter pass"
+        )
+        p.add_argument(
+            "--compare-log", action="store_true", help="Write compare/debug log"
+        )
 
         # Audio capture upgrades
-        p.add_argument("--audio-stream", default=None, help="Force audio stream mapping (example: 0:a:1). Overrides auto-pick.")
-        p.add_argument("--no-audio-auto", action="store_true", help="Disable auto audio stream selection.")
-        p.add_argument("--min-audio-sec", type=float, default=20.0, help="If extracted WAV is shorter than this, treat it as broken and retry extraction.")
-        p.add_argument("--audio-preset", choices=["balanced", "strong"], default=DEFAULT_AUDIO_PRESET, help="Audio preprocessing preset.")
-        p.add_argument("--audio-gain-db", type=float, default=0.0, help="Optional gain applied before filtering (example: 4.0 or -2.0).")
+        p.add_argument(
+            "--audio-stream",
+            default=None,
+            help="Force audio stream mapping (example: 0:a:1). Overrides auto-pick.",
+        )
+        p.add_argument(
+            "--no-audio-auto",
+            action="store_true",
+            help="Disable auto audio stream selection.",
+        )
+        p.add_argument(
+            "--min-audio-sec",
+            type=float,
+            default=20.0,
+            help="If extracted WAV is shorter than this, treat it as broken and retry extraction.",
+        )
+        p.add_argument(
+            "--audio-preset",
+            choices=["balanced", "strong"],
+            default=DEFAULT_AUDIO_PRESET,
+            help="Audio preprocessing preset.",
+        )
+        p.add_argument(
+            "--audio-gain-db",
+            type=float,
+            default=0.0,
+            help="Optional gain applied before filtering (example: 4.0 or -2.0).",
+        )
 
         # Ollama
-        p.add_argument("--ollama", action="store_true", help="Enable Ollama proofreading on FINAL subtitles")
-        p.add_argument("--ollama-model", default="llama3.1:latest", help="Ollama model name")
-        p.add_argument("--ollama-style", choices=["neutral", "anime", "formal"], default="neutral")
+        p.add_argument(
+            "--ollama",
+            action="store_true",
+            help="Enable Ollama proofreading on FINAL subtitles",
+        )
+        p.add_argument(
+            "--ollama-model", default="llama3.1:latest", help="Ollama model name"
+        )
+        p.add_argument(
+            "--ollama-style", choices=["neutral", "anime", "formal"], default="neutral"
+        )
         p.add_argument("--ollama-window-sec", type=float, default=45.0)
         p.add_argument("--ollama-max-chars", type=int, default=1000)
         p.add_argument("--ollama-retries", type=int, default=1)
@@ -575,7 +651,9 @@ def main() -> None:
     ap_run.add_argument("input", help="file path or URL")
     add_common(ap_run)
 
-    ap_batch = sub.add_parser("batch", help="Process all media files in a folder (recursive)")
+    ap_batch = sub.add_parser(
+        "batch", help="Process all media files in a folder (recursive)"
+    )
     ap_batch.add_argument("folder", help="folder to scan recursively")
     add_common(ap_batch)
 

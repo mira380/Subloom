@@ -54,7 +54,7 @@ class OllamaConfig:
     # Meaning/nuance protection (LLM cannot rewrite)
     # If similarity drops too far, reject correction and keep original
     max_change_ratio: float = 0.40  # allow ~40% change; bigger => stricter
-    max_abs_edit_chars: int = 28    # absolute cap on how many chars can change
+    max_abs_edit_chars: int = 28  # absolute cap on how many chars can change
 
     # Skip rules
     skip_music_lines: bool = True
@@ -122,7 +122,9 @@ def _style_hint(style: str) -> str:
     return "Keep the original tone/register. Do NOT rewrite."
 
 
-def build_proofread_prompt(lines: List[Dict[str, Any]], style: str) -> Tuple[List[Dict[str, str]], str]:
+def build_proofread_prompt(
+    lines: List[Dict[str, Any]], style: str
+) -> Tuple[List[Dict[str, str]], str]:
     """
     Returns (messages, input_json_string_for_debug)
     """
@@ -153,12 +155,7 @@ def build_proofread_prompt(lines: List[Dict[str, Any]], style: str) -> Tuple[Lis
     input_obj = {"lines": lines}
     input_json = json.dumps(input_obj, ensure_ascii=False)
 
-    user_msg = (
-        f"{examples}\n"
-        "INPUT JSON:\n"
-        f"{input_json}\n"
-        "OUTPUT JSON ONLY:\n"
-    )
+    user_msg = f"{examples}\nINPUT JSON:\n{input_json}\nOUTPUT JSON ONLY:\n"
 
     messages = [
         {"role": "system", "content": sys_rules},
@@ -192,7 +189,9 @@ def parse_lines_json(s: str) -> List[Dict[str, Any]]:
     return lines
 
 
-def validate_corrected(original: List[Dict[str, Any]], corrected: List[Dict[str, Any]]) -> None:
+def validate_corrected(
+    original: List[Dict[str, Any]], corrected: List[Dict[str, Any]]
+) -> None:
     if len(original) != len(corrected):
         raise ValueError("Line count changed")
 
@@ -251,7 +250,9 @@ def too_big_a_change(original: str, corrected: str, cfg: OllamaConfig) -> bool:
 # =========================================================
 
 
-def chunk_by_time(subs: List[Dict[str, Any]], window_sec: float, max_chars: int) -> List[List[Dict[str, Any]]]:
+def chunk_by_time(
+    subs: List[Dict[str, Any]], window_sec: float, max_chars: int
+) -> List[List[Dict[str, Any]]]:
     chunks: List[List[Dict[str, Any]]] = []
     if not subs:
         return chunks
@@ -362,7 +363,9 @@ def looks_suspicious(text: str) -> bool:
 # =========================================================
 
 
-def proofread_chunk_with_ollama(cfg: OllamaConfig, payload_lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def proofread_chunk_with_ollama(
+    cfg: OllamaConfig, payload_lines: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
     messages, _ = build_proofread_prompt(payload_lines, cfg.style)
 
     for _attempt in range(cfg.max_retries + 1):
@@ -408,7 +411,9 @@ def proofread_chunk_with_ollama(cfg: OllamaConfig, payload_lines: List[Dict[str,
 # =========================================================
 
 
-def ollama_proofread_subtitles(cfg: OllamaConfig, merged_subs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def ollama_proofread_subtitles(
+    cfg: OllamaConfig, merged_subs: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
     if not merged_subs:
         return merged_subs
 
