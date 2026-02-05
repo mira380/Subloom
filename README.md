@@ -54,7 +54,7 @@ python subloom.py run "https://youtu.be/VIDEO_ID" --ollama
 
 - Optimize code and time needed to generate subtitles ✅ (can be improved upon further)
 
-- Improve audio capturing 🟡 (improve the engine or rewrite until its what i want)
+- Improve audio capturing ⏳ (improve the engine or rewrite until its what i want)
 
 - Put in protections that prevents LLM from changing meaning/nuance and keeps original meaning clear ✅ (should be working)
 
