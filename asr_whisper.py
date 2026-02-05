@@ -1,11 +1,11 @@
 from __future__ import annotations
-from merge_subs import run, seconds_to_srt_time
 
 import json
 from dataclasses import dataclass
 from pathlib import Path
-
 from typing import Optional
+
+from merge_subs import run, seconds_to_srt_time
 
 
 @dataclass
@@ -20,8 +20,7 @@ def export_srt_from_whisper_json(
 ) -> None:
     """
     whisper.cpp outputs a JSON 'transcription' list with millisecond offsets.
-    This writes a normal SRT while capping line duration so you don't get
-    30-second mega subtitles.
+    This writes a normal SRT while capping line durations.
     """
     data = json.loads(json_path.read_text(encoding="utf-8"))
     transcription = data.get("transcription")
@@ -56,7 +55,8 @@ def export_srt_from_whisper_json(
         if end_s <= start_s:
             end_s = start_s + 1.2
 
-        if end_s - start_s > max_line_dur:
+        # cap long lines
+        if (end_s - start_s) > max_line_dur:
             end_s = start_s + max_line_dur
 
         out_lines.append(str(idx))
@@ -78,14 +78,20 @@ def run_whispercpp(
     whisper_model: Path,
     whisper_tag: str,
     max_srt_line_dur: float,
+    threads: int = 8,
+    beam_size: int = 2,
+    best_of: int = 2,
+    device: str | None = "0",
 ) -> WhisperPaths:
     """
     Pass 1: Whisper (timing source).
-    Runs whisper.cpp (large-v3), writes JSON + TXT, then generates the timing SRT from JSON.
+    Runs whisper.cpp, writes JSON + TXT, then generates the timing SRT from JSON.
+    Outputs are written next to outbase using names like:
+      <outbase>.<whisper_tag>.json/.txt/.srt
     """
-    out_prefix = f"{outbase}.{whisper_tag}"
+    out_prefix = str(outbase.parent / f"{outbase.name}.{whisper_tag}")
 
-    cmd = [
+    cmd: list[str] = [
         str(whisper_bin),
         "-m",
         str(whisper_model),
@@ -93,36 +99,37 @@ def run_whispercpp(
         str(clean_wav),
         "-l",
         "ja",
-        # Speed knobs
         "-t",
-        "8",  # CPU threads still matter even with GPU
+        str(max(1, int(threads))),
         "-bs",
-        "2",  # beam size (lower = faster)
+        str(max(1, int(beam_size))),
         "-bo",
-        "2",  # best-of  (lower = faster)
+        str(max(1, int(best_of))),
         "-mc",
-        "3",  # keep a tiny context window
-        # GPU
-        "-dev",
-        "0",
-        # Outputs
-        "-otxt",
-        "-oj",
-        "-of",
-        out_prefix,
+        "3",
     ]
+
+    # GPU (optional)
+    if device is not None:
+        cmd += ["-dev", str(device), "-fa"]
+
+    cmd += ["-otxt", "-oj", "-of", out_prefix]
 
     print("[subloom] whisper cmd:", " ".join(cmd))
     run(cmd, check=True)
 
     json_path = Path(out_prefix + ".json")
-    srt_path = Path(out_prefix + ".srt")
     txt_path = Path(out_prefix + ".txt")
+    srt_path = Path(out_prefix + ".srt")
 
     if not json_path.exists():
         raise RuntimeError(f"Whisper JSON not found after run: {json_path}")
 
-    export_srt_from_whisper_json(json_path, srt_path, max_line_dur=max_srt_line_dur)
+    # generate SRT from JSON
+    export_srt_from_whisper_json(json_path, srt_path, max_srt_line_dur)
+
+    if not srt_path.exists():
+        raise RuntimeError(f"Whisper SRT not found after export: {srt_path}")
 
     return WhisperPaths(
         json_path=json_path,

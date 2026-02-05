@@ -24,43 +24,29 @@ def _progress_bar(prefix: str, i: int, n: int) -> None:
 
 # =========================================================
 # Settings that control how the Ollama proofreading behaves
+# (model choice, chunk size, safety rules, etc.)
 # =========================================================
 
 
 @dataclass
 class OllamaConfig:
     model: str = "qwen2.5:7b-instruct"
-    url: str = "http://127.0.0.1:11434/api/chat"
+    url: str = "http://127.0.0.1:11434/api/generate"
 
     # Generation behavior (keep conservative)
-    temperature: float = 0.1
+    temperature: float = 0.2
     top_p: float = 0.9
     num_ctx: int = 4096
     timeout_sec: int = 300
 
     # Chunking
     window_sec: float = 45.0
-    max_chars: int = 1200
-
-    # Optimization (reduce wasted LLM calls)
-    # Only send "suspicious" lines by default
-    only_suspicious: bool = True
-    # If a line is mostly kanji already, likely fine
-    skip_high_kanji_ratio: float = 0.55
+    max_chars: int = 1000
 
     # Safety / behavior
     max_retries: int = 1
-
-    # Meaning/nuance protection (LLM cannot rewrite)
-    # If similarity drops too far, reject correction and keep original
-    max_change_ratio: float = 0.40  # allow ~40% change; bigger => stricter
-    max_abs_edit_chars: int = 28  # absolute cap on how many chars can change
-
-    # Skip rules
     skip_music_lines: bool = True
     skip_bracket_tags: bool = True
-    skip_pure_symbols: bool = True
-    skip_tiny_lines: bool = True
 
     # Style hint: "neutral" | "anime" | "formal"
     style: str = "neutral"
@@ -68,28 +54,35 @@ class OllamaConfig:
     # UX
     show_progress: bool = True
 
+    # Context chooser behavior
+    context_lines: int = 1  # prev/next
+    only_suspicious: bool = True
+
+    # Nuance protection
+    max_change_ratio: float = 0.40
+    max_abs_edit_chars: int = 28
+
 
 # =========================================================
 # Talking to Ollama
+# Handles the HTTP request that sends text to the LLM and
+# gets corrected subtitle lines back.
 # =========================================================
 
 
-def ollama_chat(cfg: OllamaConfig, messages: List[Dict[str, str]]) -> str:
+def ollama_generate(cfg: OllamaConfig, prompt: str) -> str:
     """
-    Calls Ollama /api/chat and returns assistant message content as plain text.
+    Uses Ollama /api/chat endpoint and returns assistant message content as plain text.
     """
     url = cfg.url.rstrip("/")
+    # Allow cfg.url to be either base host or full /api/chat
     if not url.endswith("/api/chat"):
-        # allow passing base host or /api/generate by mistake; normalize to /api/chat
-        if url.endswith("/api/generate"):
-            url = url[: -len("/api/generate")] + "/api/chat"
-        else:
-            url = url + "/api/chat"
+        url = url + "/api/chat"
 
     payload = {
         "model": cfg.model,
         "stream": False,
-        "messages": messages,
+        "messages": [{"role": "user", "content": prompt}],
         "options": {
             "temperature": cfg.temperature,
             "top_p": cfg.top_p,
@@ -104,73 +97,57 @@ def ollama_chat(cfg: OllamaConfig, messages: List[Dict[str, str]]) -> str:
     with urllib.request.urlopen(req, timeout=cfg.timeout_sec) as resp:
         out = json.loads(resp.read().decode("utf-8"))
 
+    # Ollama chat response shape:
+    # {"message":{"role":"assistant","content":"..."}, ...}
     msg = out.get("message") or {}
     return msg.get("content", "")
 
 
 # =========================================================
-# Prompting (locked-down, JSON only)
+# How we explain the task to the AI
+# Builds the strict “proofread subtitles” instructions that
+# get sent along with each chunk.
 # =========================================================
 
 
 def _style_hint(style: str) -> str:
     s = (style or "neutral").lower().strip()
     if s == "anime":
-        return "Keep casual spoken Japanese if present (anime/TV dialogue vibe)."
+        return "Style: natural spoken Japanese typical of anime/TV dialogue. Keep casual tone if present.\n"
     if s == "formal":
-        return "Keep polite/formal tone if present. Do NOT make casual lines formal."
-    return "Keep the original tone/register. Do NOT rewrite."
+        return "Style: keep polite/formal tone if present. Do not make casual lines formal.\n"
+    return "Style: keep the original tone/register. Do not rewrite.\n"
 
 
-def build_proofread_prompt(
-    lines: List[Dict[str, Any]], style: str
-) -> Tuple[List[Dict[str, str]], str]:
-    """
-    Returns (messages, input_json_string_for_debug)
-    """
-    sys_rules = (
+def build_choice_prompt(items: List[Dict[str, Any]], style: str) -> str:
+    rules = (
         "You are a Japanese subtitle proofreader.\n"
-        "Your job is ONLY to fix obvious transcription issues while preserving meaning and nuance.\n"
-        f"Style: {_style_hint(style)}\n\n"
-        "ABSOLUTE RULES:\n"
-        "1) Do NOT paraphrase or rewrite. If a line is already fine, return it unchanged.\n"
-        "2) Do NOT add/remove info. Do NOT change tone/nuance. Do NOT summarize.\n"
-        "3) Do NOT merge/split lines. Keep the same number of lines.\n"
-        "4) Keep each line's index i exactly the same.\n"
-        "5) Allowed edits only: kanji/kana fixes, okurigana, small particle mistakes, obvious mishearing fixes,\n"
-        "   punctuation/spacing normalization.\n"
-        "6) Output ONLY valid JSON in EXACT schema:\n"
-        '   {"lines": [{"i": <int>, "text": <string>}, ...]}\n'
-        "7) No explanations. No markdown. No extra keys.\n"
+        "Goal: preserve meaning/nuance and choose the most correct candidate.\n"
+        + _style_hint(style)
+        + "\n"
+        "STRICT RULES:\n"
+        "1) Do NOT rewrite or paraphrase.\n"
+        "2) ONLY choose from the provided candidates A/B/C.\n"
+        "3) Use context (prev/next lines) to decide.\n"
+        "4) If uncertain, pick A.\n"
+        "5) Return ONLY valid JSON in the EXACT schema:\n"
+        '   {"lines": [{"i": <int>, "pick": "A"|"B"|"C"}, ...]}\n'
+        "6) Do NOT include explanations, markdown, or extra keys.\n"
     )
 
-    examples = (
-        "Acceptable examples:\n"
-        "- きょう → 今日 (when clearly intended)\n"
-        "- それわ → それは\n"
-        "- punctuation normalize: …, 「」, ！, ？\n"
-        "- obvious misheard word correction without rephrasing\n"
-    )
-
-    input_obj = {"lines": lines}
-    input_json = json.dumps(input_obj, ensure_ascii=False)
-
-    user_msg = f"{examples}\nINPUT JSON:\n{input_json}\nOUTPUT JSON ONLY:\n"
-
-    messages = [
-        {"role": "system", "content": sys_rules},
-        {"role": "user", "content": user_msg},
-    ]
-    return messages, input_json
+    input_json = json.dumps({"items": items}, ensure_ascii=False)
+    return f"{rules}\nINPUT JSON:\n{input_json}\nOUTPUT JSON ONLY:\n"
 
 
 # =========================================================
-# JSON parsing + validation
+# Making sure the AI didn't go rogue
+# Extracts JSON from the model response and checks that it
+# didn’t change line counts, indices, or bloat the text.
 # =========================================================
 
 
 def _extract_json_object(s: str) -> str:
-    s = (s or "").strip()
+    s = s.strip()
     if s.startswith("{") and s.endswith("}"):
         return s
     start = s.find("{")
@@ -180,38 +157,23 @@ def _extract_json_object(s: str) -> str:
     return s
 
 
-def parse_lines_json(s: str) -> List[Dict[str, Any]]:
+def parse_choice_json(s: str) -> Dict[int, str]:
     s = _extract_json_object(s)
     obj = json.loads(s)
     lines = obj.get("lines")
     if not isinstance(lines, list):
         raise ValueError("Missing or invalid lines[]")
-    return lines
 
+    picks: Dict[int, str] = {}
+    for it in lines:
+        if not isinstance(it, dict):
+            continue
+        i = it.get("i")
+        pick = it.get("pick")
+        if isinstance(i, int) and pick in ("A", "B", "C"):
+            picks[i] = pick
 
-def validate_corrected(
-    original: List[Dict[str, Any]], corrected: List[Dict[str, Any]]
-) -> None:
-    if len(original) != len(corrected):
-        raise ValueError("Line count changed")
-
-    for o, c in zip(original, corrected):
-        if o["i"] != c.get("i"):
-            raise ValueError("Index mismatch")
-
-        t = c.get("text", "")
-        if not isinstance(t, str) or not t.strip():
-            raise ValueError("Empty/invalid text")
-
-        o_text = str(o.get("text", ""))
-        # Basic bloat guard
-        if len(t) > max(80, int(len(o_text) * 2.0)):
-            raise ValueError("Over-expansion")
-
-
-# =========================================================
-# Meaning / nuance protections
-# =========================================================
+    return picks
 
 
 def _similarity(a: str, b: str) -> float:
@@ -225,28 +187,22 @@ def too_big_a_change(original: str, corrected: str, cfg: OllamaConfig) -> bool:
         return True
 
     sim = _similarity(o, c)
-
-    # How many characters differ (roughly)
-    # (SequenceMatcher doesn't give edit distance; this is a cheap cap)
     abs_diff = abs(len(o) - len(c))
-    # Also count "replacement-like" difference via similarity
     approx_changed = int(round((1.0 - sim) * max(len(o), len(c))))
 
-    # If similarity too low, it probably rewrote
     if sim < (1.0 - cfg.max_change_ratio):
         return True
-
-    # If change is huge even if similarity passes, reject
     if abs_diff > cfg.max_abs_edit_chars:
         return True
     if approx_changed > cfg.max_abs_edit_chars:
         return True
-
     return False
 
 
 # =========================================================
-# Chunking subtitles
+# Breaking subtitles into safe-sized pieces
+# Sends short time windows instead of the whole file so
+# context stays manageable and outputs stay consistent.
 # =========================================================
 
 
@@ -282,27 +238,15 @@ def chunk_by_time(
 
 
 # =========================================================
-# Skip / filter logic (speed)
+# Lines we don't bother sending to the AI
+# Skips music notes, sound tags, or tiny bracket lines that
+# don't need proofreading.
 # =========================================================
-
-
-_TAG_BRACKET_RE = re.compile(r"^\s*[\[\(（].*[\]\)）]\s*$")
-
-
-def _count_kanji(s: str) -> int:
-    return sum(1 for c in s if "\u4e00" <= c <= "\u9fff")
-
-
-def _count_hiragana(s: str) -> int:
-    return sum(1 for c in s if "\u3040" <= c <= "\u309f")
 
 
 def should_skip_line(text: str, cfg: OllamaConfig) -> bool:
     t = (text or "").strip()
     if not t:
-        return True
-
-    if cfg.skip_tiny_lines and len(t) < 4:
         return True
 
     if cfg.skip_music_lines:
@@ -312,102 +256,143 @@ def should_skip_line(text: str, cfg: OllamaConfig) -> bool:
             return True
 
     if cfg.skip_bracket_tags:
-        # Short bracket tags like [SFX], (笑), （笑） etc.
-        if _TAG_BRACKET_RE.match(t) and len(t) <= 14:
-            return True
-
-    if cfg.skip_pure_symbols:
-        # Only punctuation / long dashes / ellipses etc.
-        if re.fullmatch(r"[♪♫〜～ー…・.。！？!?、，「」『』（）\(\)\[\]\s]+", t):
-            return True
-        if re.fullmatch(r"[0-9０-９\s]+", t):
-            return True
-
-    # If it's already mostly kanji, it's usually already "clean"
-    kanji = _count_kanji(t)
-    if len(t) >= 8 and (kanji / max(1, len(t))) >= cfg.skip_high_kanji_ratio:
-        return True
+        if (t.startswith("[") and t.endswith("]")) or (
+            t.startswith("（") and t.endswith("）")
+        ):
+            if len(t) <= 12:
+                return True
 
     return False
 
 
 def looks_suspicious(text: str) -> bool:
-    """
-    Heuristic: lines that are hiragana-heavy tend to hide ASR/kanji errors.
-    Also flags weird romaji or obvious placeholder output.
-    """
     t = (text or "").strip()
     if not t:
         return False
-
-    # romaji heavy
     if re.search(r"[A-Za-z]{4,}", t):
         return True
-
-    hira = _count_hiragana(t)
-    kanji = _count_kanji(t)
-
-    # hiragana-heavy and not tiny
-    if len(t) >= 8 and hira > kanji:
-        return True
-
-    # common ASR “weirdness”
     if "  " in t:
         return True
-
     return False
 
 
-# =========================================================
-# Proofreading chunk (safe apply)
-# =========================================================
+def _tiny_fix_candidate(text: str) -> str:
+    t = (text or "").strip()
+    if not t:
+        return t
+    t = re.sub(r"\s+", " ", t)
+    t = t.replace("...", "…").replace("・・", "…")
+    t = t.replace("．", "。").replace("，", "、")
+    t = t.replace("?", "？").replace("!", "！")
+    return t
 
 
-def proofread_chunk_with_ollama(
-    cfg: OllamaConfig, payload_lines: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
-    messages, _ = build_proofread_prompt(payload_lines, cfg.style)
+def build_candidates(sub: Dict[str, Any], cfg: OllamaConfig) -> List[Tuple[str, str]]:
+    """
+    Candidate sets for the chooser model.
+    A: Whisper text (timing source)
+    B: Current merged text with tiny safe normalization
+    C: Kotoba text (alt hypothesis)
 
-    for _attempt in range(cfg.max_retries + 1):
-        resp = ollama_chat(cfg, messages)
+    Notes:
+    - This does NOT ask the model to write new text.
+    - If kotoba_text is missing, C falls back to merged.
+    """
+    whisper = str(sub.get("whisper_text") or sub.get("text") or "").strip()
+    merged = str(sub.get("text") or "").strip()
+    kotoba = str(sub.get("kotoba_text") or "").strip()
+
+    b = _tiny_fix_candidate(merged)
+
+    if not kotoba:
+        kotoba = merged
+    if not whisper:
+        whisper = merged
+
+    return [("A", whisper), ("B", b), ("C", kotoba)]
+
+
+def _gather_context(lines: List[str], idx: int, k: int) -> Tuple[List[str], List[str]]:
+    prev = []
+    nxt = []
+    for j in range(1, k + 1):
+        if idx - j >= 0:
+            prev.append(lines[idx - j])
+        if idx + j < len(lines):
+            nxt.append(lines[idx + j])
+    prev.reverse()
+    return prev, nxt
+
+
+def choose_with_context(
+    cfg: OllamaConfig,
+    chunk: List[Dict[str, Any]],
+) -> Dict[int, str]:
+    chunk_sorted = sorted(chunk, key=lambda d: int(d["i"]))
+    texts = [str(d.get("text", "")) for d in chunk_sorted]
+    ids = [int(d["i"]) for d in chunk_sorted]
+
+    items: List[Dict[str, Any]] = []
+    for local_idx, (i, cur_text) in enumerate(zip(ids, texts)):
+        if should_skip_line(cur_text, cfg):
+            continue
+        if cfg.only_suspicious and not looks_suspicious(cur_text):
+            continue
+
+        prev, nxt = _gather_context(texts, local_idx, max(0, int(cfg.context_lines)))
+
+        cands = build_candidates(chunk_sorted[local_idx], cfg)
+
+        items.append(
+            {
+                "i": i,
+                "prev": prev,
+                "cur": cur_text,
+                "next": nxt,
+                "candidates": [{"k": k, "text": t} for (k, t) in cands],
+            }
+        )
+
+    if not items:
+        return {}
+
+    prompt = build_choice_prompt(items, cfg.style)
+
+    for attempt in range(cfg.max_retries + 1):
+        resp = ollama_generate(cfg, prompt)
         try:
-            corrected = parse_lines_json(resp)
-            validate_corrected(payload_lines, corrected)
+            picks = parse_choice_json(resp)
 
-            # Meaning/nuance guard: revert any line that changes too much
-            safe: List[Dict[str, Any]] = []
-            for o, c in zip(payload_lines, corrected):
-                o_text = str(o.get("text", ""))
-                c_text = str(c.get("text", ""))
+            out: Dict[int, str] = {}
+            for it in items:
+                i = int(it["i"])
+                cur_text = str(it["cur"])
+                cand_map = {c["k"]: str(c["text"]) for c in it["candidates"]}
 
-                if too_big_a_change(o_text, c_text, cfg):
-                    safe.append({"i": int(o["i"]), "text": o_text})
-                else:
-                    safe.append({"i": int(o["i"]), "text": c_text})
+                pick = picks.get(i, "A")
+                chosen = cand_map.get(pick, cur_text)
 
-            return safe
+                # leash: if it picked something that changes too much, revert
+                if too_big_a_change(cur_text, chosen, cfg):
+                    chosen = cur_text
 
+                out[i] = chosen
+
+            return out
         except Exception:
-            # tighten reminder without changing payload
-            messages = [
-                messages[0],
-                {
-                    "role": "user",
-                    "content": (
-                        messages[1]["content"]
-                        + "\nREMINDER: OUTPUT JSON ONLY. NO EXTRA TEXT. DO NOT CHANGE LINE COUNT OR INDICES.\n"
-                        "Do NOT paraphrase. If already fine, return the original text exactly.\n"
-                    ),
-                },
-            ]
-            time.sleep(0.10)
+            prompt = (
+                build_choice_prompt(items, cfg.style)
+                + "\nREMINDER: OUTPUT JSON ONLY. NO EXTRA TEXT. Picks must be A/B/C. If unsure pick A.\n"
+            )
+            time.sleep(0.12)
 
-    # fail-soft
-    return payload_lines
+    return {}
 
 
 # =========================================================
-# Entry point: what the rest of Subloom calls
+# What the rest of Subloom calls
+# Entry point that runs proofreading over the subtitle list,
+# chunk by chunk.
 # =========================================================
 
 
@@ -418,49 +403,25 @@ def ollama_proofread_subtitles(
         return merged_subs
 
     chunks = chunk_by_time(merged_subs, cfg.window_sec, cfg.max_chars)
-    total_chunks = len(chunks)
 
+    total_chunks = len(chunks)
     if cfg.show_progress and total_chunks:
-        _progress_bar("[ollama] proofreading", 0, total_chunks)
+        _progress_bar("[ollama] context-check", 0, total_chunks)
 
     for chunk_idx, ch in enumerate(chunks, start=1):
-        payload: List[Dict[str, Any]] = []
-        originals: Dict[int, str] = {}
+        chosen_map = choose_with_context(cfg, ch)
 
-        for s in ch:
-            i = int(s["i"])
-            text = str(s.get("text", ""))
-
-            originals[i] = text
-
-            # Skip obvious junk
-            if should_skip_line(text, cfg):
-                continue
-
-            # Optional: only send lines likely to benefit
-            if cfg.only_suspicious and not looks_suspicious(text):
-                continue
-
-            payload.append({"i": i, "text": text})
-
-        if payload:
-            corrected = proofread_chunk_with_ollama(cfg, payload)
-            corr_map = {int(d["i"]): str(d["text"]) for d in corrected}
-
-            # Apply corrected lines (already safety-checked)
+        if chosen_map:
             for s in ch:
                 i = int(s["i"])
-                if i in corr_map:
-                    s["text"] = corr_map[i]
-                else:
-                    # untouched lines remain as-is
-                    s["text"] = originals[i]
+                if i in chosen_map:
+                    s["text"] = chosen_map[i]
 
         if cfg.show_progress and total_chunks:
-            _progress_bar("[ollama] proofreading", chunk_idx, total_chunks)
+            _progress_bar("[ollama] context-check", chunk_idx, total_chunks)
 
     if cfg.show_progress and total_chunks:
-        _progress_bar("[ollama] proofreading", total_chunks, total_chunks)
+        _progress_bar("[ollama] context-check", total_chunks, total_chunks)
         sys.stderr.write("\n")
         sys.stderr.flush()
 

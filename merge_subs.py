@@ -41,7 +41,7 @@ W_LEN_PENALTY = 0.35
 
 
 # ----------------------------
-# Low-level runner + progressruforts.
+# Low-level runner + progress
 # ----------------------------
 
 
@@ -134,6 +134,10 @@ class SrtItem:
     end: str
     text: str
 
+    # extra fields (ignored by writer, used for Ollama context choosing)
+    whisper_text: str = ""
+    kotoba_text: str = ""
+
 
 @dataclass
 class Seg:
@@ -176,6 +180,81 @@ def write_srt_items(items: list[SrtItem], out_path: Path) -> None:
     out_path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def dedupe_consecutive_items(
+    items: list[SrtItem],
+    *,
+    window_s: float = 1.5,
+    short_len: int = 10,
+    sim_at_least: float = 0.92,
+    min_overlap_ratio: float = 0.65,
+) -> list[SrtItem]:
+    """
+    Collapse consecutive duplicates / near-duplicates.
+
+    Tier A (always):
+      - exact normalized match (no length limit), within window_s
+
+    Tier B (safe):
+      - high similarity AND strong time overlap
+      - more permissive for short lines
+    """
+    if not items:
+        return items
+
+    def _overlap_ratio(a0: float, a1: float, b0: float, b1: float) -> float:
+        inter = overlap(a0, a1, b0, b1)
+        denom = max(1e-6, min(a1 - a0, b1 - b0))
+        return inter / denom
+
+    out: list[SrtItem] = []
+    for cur in items:
+        if not out:
+            out.append(cur)
+            continue
+
+        prev = out[-1]
+
+        p0 = srt_time_to_seconds(prev.start)
+        p1 = srt_time_to_seconds(prev.end)
+        c0 = srt_time_to_seconds(cur.start)
+        c1 = srt_time_to_seconds(cur.end)
+
+        gap = c0 - p1
+        if gap > window_s:
+            out.append(cur)
+            continue
+
+        pn = normalize_jp(prev.text)
+        cn = normalize_jp(cur.text)
+
+        if not pn or not cn:
+            out.append(cur)
+            continue
+
+        # Tier A: exact normalized duplicate (no length limit)
+        if pn == cn:
+            prev.end = max(prev.end, cur.end, key=srt_time_to_seconds)
+            continue
+
+        # Tier B: near-duplicate, but require strong overlap + high similarity
+        ov = _overlap_ratio(p0, p1, c0, c1)
+        sim = sim_ratio_norm(pn, cn)
+
+        is_short = (len(pn) <= short_len) and (len(cn) <= short_len)
+
+        # short lines are allowed a bit more easily
+        need_ov = min_overlap_ratio if not is_short else (min_overlap_ratio * 0.5)
+
+        if sim >= sim_at_least and ov >= need_ov:
+            prev.end = max(prev.end, cur.end, key=srt_time_to_seconds)
+            # keep prev.text (don’t flip-flop between minor variants)
+            continue
+
+        out.append(cur)
+
+    return out
+
+
 # ----------------------------
 # Optional Ollama proofreading (keeps timings)
 # ----------------------------
@@ -196,6 +275,8 @@ def apply_ollama_to_srt_items(items: list[SrtItem], cfg) -> list[SrtItem]:
                 "start": srt_time_to_seconds(it.start),
                 "end": srt_time_to_seconds(it.end),
                 "text": it.text or "",
+                "whisper_text": (getattr(it, "whisper_text", "") or ""),
+                "kotoba_text": (getattr(it, "kotoba_text", "") or ""),
             }
         )
 
@@ -209,26 +290,30 @@ def apply_ollama_to_srt_items(items: list[SrtItem], cfg) -> list[SrtItem]:
 
 
 # ----------------------------
-# Normalization + similarity
+# Normalization + similarity (optimized)
 # ----------------------------
+
+_RE_SPACES = re.compile(r"\s+")
+_RE_BRACKETS = re.compile(r"[「」『』（）()\[\]【】〈〉《》]")
+_RE_PUNCT = re.compile(r"[。、，．,.!！?？…・:：;；〜～\-—_]")
 
 
 def normalize_jp(s: str) -> str:
-    s = s.strip()
-    s = re.sub(r"\s+", "", s)
-    s = re.sub(r"[「」『』（）()\[\]【】〈〉《》]", "", s)
-    s = re.sub(r"[。、，．,.!！?？…・:：;；〜～\-—_]", "", s)
+    s = (s or "").strip()
+    if not s:
+        return ""
+    s = _RE_SPACES.sub("", s)
+    s = _RE_BRACKETS.sub("", s)
+    s = _RE_PUNCT.sub("", s)
     return s
 
 
-def sim_ratio(a: str, b: str) -> float:
-    a2 = normalize_jp(a)
-    b2 = normalize_jp(b)
-    if not a2 and not b2:
+def sim_ratio_norm(a_norm: str, b_norm: str) -> float:
+    if not a_norm and not b_norm:
         return 1.0
-    if not a2 or not b2:
+    if not a_norm or not b_norm:
         return 0.0
-    return SequenceMatcher(None, a2, b2).ratio()
+    return SequenceMatcher(None, a_norm, b_norm).ratio()
 
 
 def load_whispercpp_segments(json_path: Path) -> list[Seg]:
@@ -265,45 +350,43 @@ def load_whispercpp_segments(json_path: Path) -> list[Seg]:
 
 
 def merge_kotoba_micro_segments(segs: list[Seg]) -> list[Seg]:
+    """
+    Merge tiny Kotoba micro-segments into bigger chunks.
+    Optimization: normalize once per segment and track normalized length.
+    """
     if not segs:
         return segs
+
+    norm = [normalize_jp(s.text) for s in segs]
+    norm_len = [len(x) for x in norm]
+
     merged: list[Seg] = []
     cur = Seg(i=0, t0=segs[0].t0, t1=segs[0].t1, text=segs[0].text)
-    for s in segs[1:]:
+    cur_norm_len = norm_len[0]
+
+    for idx, s in enumerate(segs[1:], start=1):
         gap = s.t0 - cur.t1
         if gap <= KOTOBA_MERGE_GAP_S and (
-            len(normalize_jp(cur.text)) + len(normalize_jp(s.text))
-            <= KOTOBA_MERGE_MAX_CHARS
+            cur_norm_len + norm_len[idx] <= KOTOBA_MERGE_MAX_CHARS
         ):
             cur = Seg(i=0, t0=cur.t0, t1=max(cur.t1, s.t1), text=(cur.text + s.text))
+            cur_norm_len += norm_len[idx]
         else:
             merged.append(cur)
             cur = Seg(i=0, t0=s.t0, t1=s.t1, text=s.text)
+            cur_norm_len = norm_len[idx]
+
     merged.append(cur)
 
     out: list[Seg] = []
-    for idx, s in enumerate(merged):
-        out.append(Seg(i=idx, t0=s.t0, t1=s.t1, text=s.text.strip()))
+    for i, s in enumerate(merged):
+        out.append(Seg(i=i, t0=s.t0, t1=s.t1, text=s.text.strip()))
     return out
 
 
 # ----------------------------
 # Smart merge brain
 # ----------------------------
-
-
-def len_ratio(a: str, b: str) -> float:
-    a2 = normalize_jp(a)
-    b2 = normalize_jp(b)
-    if not a2 and not b2:
-        return 1.0
-    if not a2:
-        return 9.9
-    return max(0.0, len(b2) / max(1, len(a2)))
-
-
-def span_text(segs: list[Seg], start: int, span: int) -> str:
-    return "".join(s.text for s in segs[start : start + span]).strip()
 
 
 def span_overlap_coverage(
@@ -321,10 +404,22 @@ def best_span_for_whisper_line(
     w0: float,
     w1: float,
     segs: list[Seg],
+    segs_norm: list[str],
+    segs_norm_len: list[int],
     k_start_hint: int,
 ) -> tuple[Optional[tuple[int, int]], float, float, float, float, str]:
+    """
+    Optimized version:
+    - normalize Whisper once
+    - reuse pre-normalized Kotoba segments
+    - build span normalized text incrementally per start
+    - avoid repeated normalize_jp()/SequenceMatcher calls
+    """
     if not segs:
         return None, -1e9, 0.0, 0.0, 0.0, ""
+
+    w_norm = normalize_jp(w_text)
+    w_len = len(w_norm)
 
     k = max(0, min(k_start_hint, len(segs)))
     while k < len(segs) and segs[k].t1 < w0:
@@ -333,7 +428,7 @@ def best_span_for_whisper_line(
     start_min = max(0, k - 2)
     start_max = min(len(segs) - 1, k + 6)
 
-    best = None
+    best: Optional[tuple[int, int]] = None
     best_score = -1e9
     best_sim = 0.0
     best_cov = 0.0
@@ -344,11 +439,21 @@ def best_span_for_whisper_line(
         if segs[sidx].t0 > w1:
             break
 
-        for span in range(1, MAX_SPAN + 1):
-            if sidx + span > len(segs):
-                continue
+        raw_acc = ""
+        norm_acc = ""
+        norm_len_acc = 0
 
-            txt = span_text(segs, sidx, span)
+        # build spans 1..MAX_SPAN incrementally (same start)
+        for span in range(1, MAX_SPAN + 1):
+            j = sidx + span - 1
+            if j >= len(segs):
+                break
+
+            raw_acc += segs[j].text
+            norm_acc += segs_norm[j]
+            norm_len_acc += segs_norm_len[j]
+
+            txt = raw_acc.strip()
             if not txt:
                 continue
 
@@ -356,8 +461,15 @@ def best_span_for_whisper_line(
             if cov <= 0.0:
                 continue
 
-            sim = sim_ratio(w_text, txt)
-            lr = len_ratio(w_text, txt)
+            sim = sim_ratio_norm(w_norm, norm_acc)
+
+            # length ratio using normalized lengths (no repeated normalize)
+            if w_len == 0 and norm_len_acc == 0:
+                lr = 1.0
+            elif w_len == 0:
+                lr = 9.9
+            else:
+                lr = max(0.0, norm_len_acc / max(1, w_len))
 
             lp = abs(math.log(lr)) if lr > 0 else 2.0
             score = (W_SIM * sim) + (W_COVER * cov) - (W_LEN_PENALTY * lp)
@@ -373,13 +485,9 @@ def best_span_for_whisper_line(
     return best, best_score, best_sim, best_cov, best_lr, best_txt
 
 
-def overlaps_any_whisper(
-    seg: Seg, whisper_windows: list[tuple[float, float]], max_overlap: float
-) -> bool:
-    for w0, w1 in whisper_windows:
-        if overlap(seg.t0, seg.t1, w0, w1) > max_overlap:
-            return True
-    return False
+# ----------------------------
+# Main merge
+# ----------------------------
 
 
 def auto_merge_and_insert(
@@ -402,6 +510,10 @@ def auto_merge_and_insert(
     k_segs_raw = load_whispercpp_segments(kotoba_json)
     k_segs = merge_kotoba_micro_segments(k_segs_raw)
 
+    # precompute normalized kotoba segs once (big win)
+    k_norm = [normalize_jp(s.text) for s in k_segs]
+    k_norm_len = [len(x) for x in k_norm]
+
     used_k: set[int] = set()
     log: list[str] = []
 
@@ -423,7 +535,7 @@ def auto_merge_and_insert(
     final: list[SrtItem] = []
     k_hint = 0
 
-    # 1) Replace text using best-span selection + guardrails
+    # 1) Replace text using best-span selection + guardrails (optimized)
     for it in w_items:
         w0 = srt_time_to_seconds(it.start)
         w1 = srt_time_to_seconds(it.end)
@@ -433,6 +545,8 @@ def auto_merge_and_insert(
             w0=w0,
             w1=w1,
             segs=k_segs,
+            segs_norm=k_norm,
+            segs_norm_len=k_norm_len,
             k_start_hint=k_hint,
         )
 
@@ -450,7 +564,7 @@ def auto_merge_and_insert(
                 (not topic_jump)
                 and cov >= MIN_OVERLAP_COVERAGE
                 and sim >= SIM_REPLACE_AT_LEAST
-                and (lr >= MIN_LEN_RATIO and lr <= MAX_LEN_RATIO)
+                and (MIN_LEN_RATIO <= lr <= MAX_LEN_RATIO)
             )
 
             if ok:
@@ -486,10 +600,23 @@ def auto_merge_and_insert(
                     log.append(f"  kotoba : {ktxt}")
                     log.append("")
 
-        final.append(SrtItem(idx=it.idx, start=it.start, end=it.end, text=chosen))
+        final.append(
+            SrtItem(
+                idx=it.idx,
+                start=it.start,
+                end=it.end,
+                text=chosen,
+                whisper_text=(it.text or "").strip(),
+                kotoba_text=(ktxt or "").strip(),
+            )
+        )
 
-    # 2) Gap insertion using unused Kotoba segments
+    # 2) Gap insertion using unused Kotoba segments (optimized: linear scan + neighbor overlap only)
     inserts: list[SrtItem] = []
+
+    k_ptr = 0
+    n_k = len(k_segs)
+
     for i in range(len(w_items) - 1):
         a_end = srt_time_to_seconds(w_items[i].end)
         b_start = srt_time_to_seconds(w_items[i + 1].start)
@@ -497,22 +624,45 @@ def auto_merge_and_insert(
         if gap < INSERT_GAP_MIN_S:
             continue
 
+        # move pointer forward to first segment that could fit after a_end
+        while k_ptr < n_k and k_segs[k_ptr].t1 <= a_end:
+            k_ptr += 1
+
         inserted_here = 0
-        for ks in k_segs:
+        j = k_ptr
+
+        prev_w0, prev_w1 = w_windows[i]
+        next_w0, next_w1 = w_windows[i + 1]
+
+        while j < n_k and k_segs[j].t0 < b_start:
             if inserted_here >= INSERT_MAX_CONSECUTIVE:
                 break
+
+            ks = k_segs[j]
+
             if ks.i in used_k:
+                j += 1
                 continue
             if ks.t0 < a_end or ks.t1 > b_start:
+                j += 1
                 continue
             if (ks.t1 - ks.t0) > INSERT_MAX_SEG_DUR_S:
-                continue
-            if not ks.text.strip():
+                j += 1
                 continue
 
-            if overlaps_any_whisper(
-                ks, w_windows, max_overlap=INSERT_MIN_OVERLAP_WITH_WHISPER
+            txt = ks.text.strip()
+            if not txt:
+                j += 1
+                continue
+
+            # In a gap, only the neighboring whisper windows can overlap meaningfully
+            if (
+                overlap(ks.t0, ks.t1, prev_w0, prev_w1)
+                > INSERT_MIN_OVERLAP_WITH_WHISPER
+                or overlap(ks.t0, ks.t1, next_w0, next_w1)
+                > INSERT_MIN_OVERLAP_WITH_WHISPER
             ):
+                j += 1
                 continue
 
             inserts.append(
@@ -520,7 +670,9 @@ def auto_merge_and_insert(
                     idx=0,
                     start=seconds_to_srt_time(ks.t0),
                     end=seconds_to_srt_time(ks.t1),
-                    text=ks.text.strip(),
+                    text=txt,
+                    whisper_text=txt,
+                    kotoba_text=txt,
                 )
             )
             used_k.add(ks.i)
@@ -530,8 +682,10 @@ def auto_merge_and_insert(
                 log.append(
                     f"[INSERT] {seconds_to_srt_time(ks.t0)} --> {seconds_to_srt_time(ks.t1)}"
                 )
-                log.append(f"  kotoba: {ks.text.strip()}")
+                log.append(f"  kotoba: {txt}")
                 log.append("")
+
+            j += 1
 
     combined = final + inserts
     combined.sort(key=lambda x: srt_time_to_seconds(x.start))
@@ -541,8 +695,20 @@ def auto_merge_and_insert(
         print(
             f"[subloom] Ollama proofreading: model={getattr(ollama_cfg, 'model', '?')}, style={getattr(ollama_cfg, 'style', '?')}"
         )
+
+        # debug: count how many lines actually change
+        before = [it.text for it in combined]
+
         combined = apply_ollama_to_srt_items(combined, ollama_cfg)
-    # --------------------------------------
+
+        after = [it.text for it in combined]
+        changed = sum(1 for a, b in zip(before, after) if a != b)
+
+        print(f"[subloom] Ollama changed {changed}/{len(combined)} lines")
+
+
+    # collapse obvious consecutive duplicates (anime-style spam repeats)
+    combined = dedupe_consecutive_items(combined, window_s=1.5, short_len=10)
 
     write_srt_items(combined, out_final_srt)
 

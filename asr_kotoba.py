@@ -1,9 +1,10 @@
 from __future__ import annotations
-from merge_subs import run
 
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+from merge_subs import run
 
 
 @dataclass
@@ -13,12 +14,6 @@ class KotobaPaths:
 
 
 def find_kotoba_ggml_model(models_dir: Path) -> Optional[Path]:
-    """
-    Picks a Kotoba GGML .bin from a folder.
-    Preference order:
-    - q5_0 if present (good speed/quality sweet spot)
-    - otherwise biggest file
-    """
     if not models_dir.exists():
         return None
     candidates = [p for p in models_dir.glob("*.bin") if p.is_file()]
@@ -40,18 +35,24 @@ def run_kotoba_whispercpp(
     *,
     whisper_bin: Path,
     kotoba_tag: str,
+    threads: int = 8,
+    beam_size: int = 2,
+    best_of: int = 2,
+    device: str | None = "0",
 ) -> KotobaPaths:
     """
     Pass 2: Kotoba (accuracy checker).
     Runs Kotoba via whisper.cpp binary, writes JSON + TXT.
     We intentionally do NOT generate a Kotoba SRT — Whisper owns timing.
+    Outputs:
+      <outbase>.<kotoba_tag>.json/.txt
     """
     if not kotoba_model_path.exists():
         raise RuntimeError(f"Kotoba GGML model not found: {kotoba_model_path}")
 
-    out_prefix = str(outbase) + f".{kotoba_tag}"
+    out_prefix = str(outbase.parent / f"{outbase.name}.{kotoba_tag}")
 
-    cmd = [
+    cmd: list[str] = [
         str(whisper_bin),
         "-m",
         str(kotoba_model_path),
@@ -59,15 +60,20 @@ def run_kotoba_whispercpp(
         str(clean_wav),
         "-l",
         "ja",
-        "-dev",
-        "0",
+        "-t",
+        str(max(1, int(threads))),
+        "-bs",
+        str(max(1, int(beam_size))),
+        "-bo",
+        str(max(1, int(best_of))),
         "-mc",
         "3",
-        "-otxt",
-        "-oj",
-        "-of",
-        out_prefix,
     ]
+
+    if device is not None:
+        cmd += ["-dev", str(device), "-fa"]
+
+    cmd += ["-otxt", "-oj", "-of", out_prefix]
 
     print("[subloom] kotoba(ggml) cmd:", " ".join(cmd))
     run(cmd, check=True)

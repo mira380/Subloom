@@ -4,6 +4,7 @@ outputs/
 *.srt
 *.json
 *.txt
+*.webm
 *.pyc
 *.bin
 __pycache__/
