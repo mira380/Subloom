@@ -265,15 +265,104 @@ def should_skip_line(text: str, cfg: OllamaConfig) -> bool:
     return False
 
 
-def looks_suspicious(text: str) -> bool:
-    t = (text or "").strip()
-    if not t:
-        return False
-    if re.search(r"[A-Za-z]{4,}", t):
-        return True
-    if "  " in t:
-        return True
-    return False
+def _normalize_jp(s: str) -> str:
+    s = (s or "").strip()
+    if not s:
+        return ""
+    s = re.sub(r"\s+", "", s)
+    s = re.sub(r"[「」『』（）()\[\]【】〈〉《》]", "", s)
+    s = re.sub(r"[。、，．,.!！?？…・:：;；〜～\-—_]", "", s)
+    return s
+
+
+def _sim_norm(a: str, b: str) -> float:
+    a = _normalize_jp(a)
+    b = _normalize_jp(b)
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def _len_ratio(a: str, b: str) -> float:
+    a = _normalize_jp(a)
+    b = _normalize_jp(b)
+    la = len(a)
+    lb = len(b)
+    if la == 0 and lb == 0:
+        return 1.0
+    if la == 0:
+        return 9.9
+    return lb / max(1, la)
+
+
+def is_suspicious(sub: Dict[str, Any], cfg: OllamaConfig) -> Tuple[bool, int, List[str]]:
+    """Automatic gate: decide whether a line is worth sending to the LLM.
+
+    Returns (should_check, context_lines, reasons)
+    """
+    cur = str(sub.get("text") or "").strip()
+    whisper = str(sub.get("whisper_text") or "").strip()
+    kotoba = str(sub.get("kotoba_text") or "").strip()
+
+    reasons: List[str] = []
+
+    # merge confidence from merge_subs (if present)
+    mconf = sub.get("merge_conf")
+    mdec = str(sub.get("merge_decision") or "")
+    try:
+        mconf_f = float(mconf) if mconf is not None else None
+    except Exception:
+        mconf_f = None
+
+    if mconf_f is not None:
+        if mconf_f < 0.55:
+            reasons.append(f"merge_low:{mconf_f:.2f}")
+        # if we kept Whisper but confidence is low, it's usually worth checking
+        if mdec == "keep" and mconf_f < 0.45:
+            reasons.append("kept_low")
+
+    # obvious junk
+    if re.search(r"[A-Za-z]{4,}", cur):
+        reasons.append("latin_run")
+    if "  " in cur:
+        reasons.append("double_space")
+    if "??" in cur or "？？" in cur:
+        reasons.append("question_marks")
+
+    # disagreement between engines (best signal)
+    if whisper and kotoba:
+        sim_wk = _sim_norm(whisper, kotoba)
+        lr_wk = _len_ratio(whisper, kotoba)
+
+        if sim_wk < 0.80 and (len(_normalize_jp(whisper)) + len(_normalize_jp(kotoba))) >= 10:
+            reasons.append(f"wk_disagree:{sim_wk:.2f}")
+        if lr_wk < 0.60 or lr_wk > 1.80:
+            reasons.append(f"wk_lenratio:{lr_wk:.2f}")
+
+        # if current merged differs from both, it might be a weird pick
+        sim_mc = _sim_norm(cur, whisper)
+        sim_mk = _sim_norm(cur, kotoba)
+        if sim_mc < 0.78 and sim_mk < 0.78 and len(_normalize_jp(cur)) >= 6:
+            reasons.append("merged_off")
+
+    # turbo-safe: very short lines usually don't need LLM
+    if len(_normalize_jp(cur)) <= 3 and not reasons:
+        return False, 0, []
+
+    should = bool(reasons)
+
+    # adaptive context: give more context only when it looks genuinely messy
+    ctx = int(getattr(cfg, "context_lines", 1) or 1)
+    if any(r.startswith("wk_disagree") for r in reasons):
+        # strong disagreement => extra context helps a lot
+        ctx = max(ctx, 2)
+    if any(r.startswith("merge_low") for r in reasons):
+        ctx = max(ctx, 2)
+    if any(r.startswith("merge_low:0.") for r in reasons) and any(r.startswith("wk_disagree") for r in reasons):
+        ctx = max(ctx, 3)
+    return should, ctx, reasons
 
 
 def _tiny_fix_candidate(text: str) -> str:
@@ -336,10 +425,14 @@ def choose_with_context(
     for local_idx, (i, cur_text) in enumerate(zip(ids, texts)):
         if should_skip_line(cur_text, cfg):
             continue
-        if cfg.only_suspicious and not looks_suspicious(cur_text):
-            continue
 
-        prev, nxt = _gather_context(texts, local_idx, max(0, int(cfg.context_lines)))
+        ctx_k = max(0, int(getattr(cfg, "context_lines", 1) or 1))
+        if cfg.only_suspicious:
+            ok, ctx_k, _reasons = is_suspicious(chunk_sorted[local_idx], cfg)
+            if not ok:
+                continue
+
+        prev, nxt = _gather_context(texts, local_idx, ctx_k)
 
         cands = build_candidates(chunk_sorted[local_idx], cfg)
 
@@ -375,6 +468,19 @@ def choose_with_context(
                 # leash: if it picked something that changes too much, revert
                 if too_big_a_change(cur_text, chosen, cfg):
                     chosen = cur_text
+
+                # extra drift guard: chosen must stay close to at least ONE candidate
+                # (this catches rare formatting / parsing weirdness)
+                try:
+                    sims = [
+                        _sim_norm(chosen, cand_map.get("A", "")),
+                        _sim_norm(chosen, cand_map.get("B", "")),
+                        _sim_norm(chosen, cand_map.get("C", "")),
+                    ]
+                    if max(sims) < 0.85 and len(_normalize_jp(chosen)) >= 6:
+                        chosen = cur_text
+                except Exception:
+                    pass
 
                 out[i] = chosen
 

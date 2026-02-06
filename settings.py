@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-
 # ----------------------------
 # Project paths
 # ----------------------------
@@ -41,8 +40,30 @@ KOTOBA_TAG: Final[str] = "kotoba"
 FINAL_TAG: Final[str] = "final"
 COMPARE_TAG: Final[str] = "compare"
 
+# ----------------------------
 # SRT formatting limits
+# ----------------------------
+
+# Safety cap: a single subtitle entry will never exceed this duration.
 MAX_SRT_LINE_DUR: Final[float] = 10.0
+
+# If subs feel early, increase this a bit (0.12–0   .25 is usually the sweet spot).
+# This shifts BOTH start + end later to preserve the original duration.
+SRT_SHIFT_S: Final[float] = 0.18
+
+# How short we allow a generated/split caption to be (seconds).
+SRT_MIN_CAPTION_DUR_S: Final[float] = 0.55
+
+# If a whisper line is too long, split it into multiple SRT entries.
+# This is the "no wall of text" knob.
+SRT_MAX_CHARS_PER_CAPTION: Final[int] = 42
+
+# Also wrap text inside a caption so it doesn’t become one mega-line.
+SRT_MAX_CHARS_PER_LINE: Final[int] = 21
+
+# Extra control: shift start and end separately (helps when only the *start* is early)
+SRT_SHIFT_START_S = 0.22
+SRT_SHIFT_END_S = 0.17
 
 
 def ensure_project_dirs() -> None:

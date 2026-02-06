@@ -79,6 +79,8 @@ def run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> RunResul
         cmd,
         cwd=str(cwd) if cwd else None,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=env,
@@ -138,9 +140,18 @@ class SrtItem:
     whisper_text: str = ""
     kotoba_text: str = ""
 
+    # merge diagnostics (used for automatic Ollama gating + reports)
+    merge_decision: str = ""   # "replace" | "keep" | "insert"
+    merge_sim: float = 0.0
+    merge_cov: float = 0.0
+    merge_lr: float = 0.0
+    merge_score: float = 0.0
+    merge_conf: float = 0.0
+
 
 @dataclass
 class Seg:
+
     i: int
     t0: float
     t1: float
@@ -277,6 +288,12 @@ def apply_ollama_to_srt_items(items: list[SrtItem], cfg) -> list[SrtItem]:
                 "text": it.text or "",
                 "whisper_text": (getattr(it, "whisper_text", "") or ""),
                 "kotoba_text": (getattr(it, "kotoba_text", "") or ""),
+                "merge_decision": (getattr(it, "merge_decision", "") or ""),
+                "merge_sim": float(getattr(it, "merge_sim", 0.0) or 0.0),
+                "merge_cov": float(getattr(it, "merge_cov", 0.0) or 0.0),
+                "merge_lr": float(getattr(it, "merge_lr", 0.0) or 0.0),
+                "merge_score": float(getattr(it, "merge_score", 0.0) or 0.0),
+                "merge_conf": float(getattr(it, "merge_conf", 0.0) or 0.0),
             }
         )
 
@@ -485,6 +502,65 @@ def best_span_for_whisper_line(
     return best, best_score, best_sim, best_cov, best_lr, best_txt
 
 
+
+
+def _clamp01(x: float) -> float:
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    return float(x)
+
+
+def _confidence_from_match(sim: float, cov: float, lr: float, *, topic_jump: bool) -> float:
+    """Heuristic confidence for a Whisper<->Kotoba match.
+
+    0.0 = likely wrong / needs help
+    1.0 = very safe
+    """
+    if topic_jump:
+        return 0.0
+
+    base = 0.55 * sim + 0.45 * cov
+
+    # if lengths are way off, treat as suspicious
+    if lr < MIN_LEN_RATIO or lr > MAX_LEN_RATIO:
+        base *= 0.55
+
+    return _clamp01(base)
+
+
+def _write_lowconf_txt(path: Path, rows: list[dict], thresh: float) -> None:
+    lows = [r for r in rows if float(r.get("conf", 0.0)) < thresh]
+    if not lows:
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
+        return
+
+    out: list[str] = []
+    out.append(f"LOW CONFIDENCE (< {thresh:.2f})")
+    out.append("")
+    for r in lows:
+        out.append(f"[{r.get('decision','?').upper()} conf={float(r.get('conf',0.0)):.2f}] {r.get('start','')} --> {r.get('end','')}")
+        w = (r.get("whisper") or "").strip()
+        k = (r.get("kotoba") or "").strip()
+        c = (r.get("chosen") or "").strip()
+        if w:
+            out.append(f"  whisper: {w}")
+        if k:
+            out.append(f"  kotoba : {k}")
+        if c:
+            out.append(f"  final  : {c}")
+        reasons = r.get("reasons") or []
+        if reasons:
+            out.append(f"  reasons: {', '.join(reasons)}")
+        out.append("")
+    path.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
+
+
 # ----------------------------
 # Main merge
 # ----------------------------
@@ -516,6 +592,7 @@ def auto_merge_and_insert(
 
     used_k: set[int] = set()
     log: list[str] = []
+    rows: list[dict] = []  # merge diagnostics for reports
 
     if out_compare_log:
         log.append("AUTO MERGE + GAP INSERT LOG")
@@ -551,6 +628,9 @@ def auto_merge_and_insert(
         )
 
         chosen = it.text
+        decision = "keep"
+        reasons: list[str] = []
+        conf = 0.18
 
         if best is not None and ktxt:
             sidx, span = best
@@ -569,6 +649,8 @@ def auto_merge_and_insert(
 
             if ok:
                 chosen = ktxt
+                decision = "replace"
+                conf = _confidence_from_match(sim, cov, lr, topic_jump=topic_jump)
                 for j in range(sidx, sidx + span):
                     used_k.add(j)
 
@@ -580,8 +662,20 @@ def auto_merge_and_insert(
                     log.append(f"  kotoba : {ktxt}")
                     log.append("")
             else:
+                conf = _confidence_from_match(sim, cov, lr, topic_jump=topic_jump) * 0.85
+                reason_bits: list[str] = []
+                if topic_jump:
+                    reason_bits.append("topic_jump")
+                if cov < MIN_OVERLAP_COVERAGE:
+                    reason_bits.append(f"cov<{MIN_OVERLAP_COVERAGE}")
+                if sim < SIM_REPLACE_AT_LEAST:
+                    reason_bits.append(f"sim<{SIM_REPLACE_AT_LEAST}")
+                if lr < MIN_LEN_RATIO or lr > MAX_LEN_RATIO:
+                    reason_bits.append(f"lr not in [{MIN_LEN_RATIO},{MAX_LEN_RATIO}]")
+                reasons = reason_bits
+
                 if out_compare_log:
-                    reason_bits = []
+
                     if topic_jump:
                         reason_bits.append("topic_jump")
                     if cov < MIN_OVERLAP_COVERAGE:
@@ -608,8 +702,33 @@ def auto_merge_and_insert(
                 text=chosen,
                 whisper_text=(it.text or "").strip(),
                 kotoba_text=(ktxt or "").strip(),
+                merge_decision=decision,
+                merge_sim=float(sim),
+                merge_cov=float(cov),
+                merge_lr=float(lr),
+                merge_score=float(score),
+                merge_conf=float(conf),
             )
         )
+
+        rows.append(
+            {
+                "i": int(it.idx),
+                "start": it.start,
+                "end": it.end,
+                "decision": decision,
+                "conf": float(conf),
+                "sim": float(sim),
+                "cov": float(cov),
+                "lr": float(lr),
+                "score": float(score),
+                "whisper": (it.text or "").strip(),
+                "kotoba": (ktxt or "").strip(),
+                "chosen": (chosen or "").strip(),
+                "reasons": reasons,
+            }
+        )
+
 
     # 2) Gap insertion using unused Kotoba segments (optimized: linear scan + neighbor overlap only)
     inserts: list[SrtItem] = []
@@ -673,8 +792,33 @@ def auto_merge_and_insert(
                     text=txt,
                     whisper_text=txt,
                     kotoba_text=txt,
+                    merge_decision="insert",
+                    merge_sim=0.0,
+                    merge_cov=0.0,
+                    merge_lr=1.0,
+                    merge_score=0.0,
+                    merge_conf=0.45,
                 )
             )
+
+            rows.append(
+                {
+                    "i": 0,
+                    "start": seconds_to_srt_time(ks.t0),
+                    "end": seconds_to_srt_time(ks.t1),
+                    "decision": "insert",
+                    "conf": 0.45,
+                    "sim": 0.0,
+                    "cov": 0.0,
+                    "lr": 1.0,
+                    "score": 0.0,
+                    "whisper": "",
+                    "kotoba": txt,
+                    "chosen": txt,
+                    "reasons": ["gap_insert"],
+                }
+            )
+
             used_k.add(ks.i)
             inserted_here += 1
 
@@ -707,7 +851,36 @@ def auto_merge_and_insert(
         print(f"[subloom] Ollama changed {changed}/{len(combined)} lines")
 
 
-    # collapse obvious consecutive duplicates (anime-style spam repeats)
+    
+    # ---- automatic merge report (always) ----
+    # Keep it lightweight: a JSON stats file + a tiny low-confidence text file.
+    try:
+        report_json = out_final_srt.with_name(out_final_srt.stem + ".report.json")
+        lowconf_txt = out_final_srt.with_name(out_final_srt.stem + ".lowconf.txt")
+        thresh = 0.55
+
+        report_json.write_text(
+            json.dumps(
+                {
+                    "whisper_srt": str(whisper_srt),
+                    "kotoba_json": str(kotoba_json),
+                    "final_srt": str(out_final_srt),
+                    "lowconf_thresh": thresh,
+                    "rows": rows,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        _write_lowconf_txt(lowconf_txt, rows, thresh)
+    except Exception:
+        # reports are best-effort; never fail the run because of them
+        pass
+
+
+# collapse obvious consecutive duplicates (anime-style spam repeats)
     combined = dedupe_consecutive_items(combined, window_s=1.5, short_len=10)
 
     write_srt_items(combined, out_final_srt)
