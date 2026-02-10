@@ -25,9 +25,7 @@ Subloom is a fully local subtitle generator for audio and video.
 - FFmpeg
 - RNNoise
 - whisper.cpp
-- An ASR engine
-  - e.g. **Kotoba Whisper**
-
+- Kotoba Whisper
 ### Optional (Recommended)
 - A GPU (huge speed improvement)
 - **Ollama** (used for kanji/text cleanup)
