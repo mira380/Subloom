@@ -308,6 +308,47 @@ def polish_timing(
     return out
 
 
+def extend_end_by_text_length(
+    items: list[SrtItem],
+    *,
+    base_s: float = 0.10,
+    per_char_s: float = 0.010,
+    max_extra_s: float = 0.35,
+    min_gap_s: float = 0.06,
+) -> list[SrtItem]:
+    """
+    Adds extra end-hold so lines don't cut off abruptly.
+    Extra hold scales with JP normalized text length.
+    Clamped to avoid overlaps with the next subtitle.
+    """
+    if not items:
+        return items
+
+    items = sorted(items, key=lambda x: srt_time_to_seconds(x.start))
+
+    for i in range(len(items) - 1):
+        cur = items[i]
+        nxt = items[i + 1]
+
+        c0 = srt_time_to_seconds(cur.start)
+        c1 = srt_time_to_seconds(cur.end)
+        n0 = srt_time_to_seconds(nxt.start)
+
+        nlen = len(normalize_jp(cur.text))
+        extra = base_s + (per_char_s * nlen)
+        if extra > max_extra_s:
+            extra = max_extra_s
+
+        # don't extend past the next line minus a small gap
+        max_end = n0 - min_gap_s
+        new_end = min(c1 + extra, max_end)
+
+        if new_end > c1 and new_end > c0 + 0.20:
+            cur.end = seconds_to_srt_time(new_end)
+
+    return items
+
+
 def dedupe_consecutive_items(
     items: list[SrtItem],
     *,
@@ -603,6 +644,49 @@ def merge_kotoba_micro_segments(segs: list[Seg]) -> list[Seg]:
 # ----------------------------
 
 
+def merge_whisper_micro_lines(
+    items: list[SrtItem],
+    *,
+    max_gap_s: float = 0.30,
+    max_len_norm: int = 6,
+) -> list[SrtItem]:
+    if not items:
+        return items
+
+    out: list[SrtItem] = []
+    i = 0
+    while i < len(items):
+        cur = items[i]
+        if i + 1 >= len(items):
+            out.append(cur)
+            break
+
+        nxt = items[i + 1]
+
+        c1 = srt_time_to_seconds(cur.end)
+        n0 = srt_time_to_seconds(nxt.start)
+
+        gap = n0 - c1
+
+        cur_norm_len = len(normalize_jp(cur.text))
+        # Merge tiny fragments like 「皆さん」 into the next line if close in time
+        if cur_norm_len > 0 and cur_norm_len <= max_len_norm and gap <= max_gap_s:
+            merged = SrtItem(
+                idx=cur.idx,
+                start=cur.start,
+                end=nxt.end,
+                text=(cur.text.rstrip() + " " + nxt.text.lstrip()).strip(),
+            )
+            out.append(merged)
+            i += 2
+            continue
+
+        out.append(cur)
+        i += 1
+
+    return out
+
+
 def span_overlap_coverage(
     w0: float, w1: float, segs: list[Seg], start: int, span: int
 ) -> float:
@@ -639,7 +723,7 @@ def best_span_for_whisper_line(
     while k < len(segs) and segs[k].t1 < w0:
         k += 1
 
-    start_min = max(0, k - 2)
+    start_min = max(0, k)
     start_max = min(len(segs) - 1, k + 6)
 
     best: Optional[tuple[int, int]] = None
@@ -803,6 +887,7 @@ def auto_merge_and_insert(
     Optionally runs Ollama proofreading at the end (text only, no timing changes).
     """
     w_items = parse_srt(whisper_srt)
+    w_items = merge_whisper_micro_lines(w_items)
     w_windows = [
         (srt_time_to_seconds(it.start), srt_time_to_seconds(it.end)) for it in w_items
     ]
@@ -858,7 +943,8 @@ def auto_merge_and_insert(
 
         if best is not None and ktxt:
             sidx, span = best
-            k_hint = max(k_hint, sidx)
+            # advance hint past the used span to prevent reuse
+            k_hint = max(k_hint, sidx + span)
 
             topic_jump = (
                 cov >= TOPIC_JUMP_OVERLAP_AT_LEAST and sim < TOPIC_JUMP_SIM_BELOW
@@ -996,6 +1082,24 @@ def auto_merge_and_insert(
                 j += 1
                 continue
 
+            # Reject Kotoba hallucinations in gaps:
+            # must resemble at least one neighbor whisper line
+            prev_w_txt = normalize_jp(w_items[i].text)
+            next_w_txt = normalize_jp(w_items[i + 1].text)
+            k_txt_norm = normalize_jp(txt)
+
+            if (
+                sim_ratio_norm(k_txt_norm, prev_w_txt) < 0.25
+                and sim_ratio_norm(k_txt_norm, next_w_txt) < 0.25
+            ):
+                j += 1
+                continue
+
+            # Skip extremely short inserts (often hallucinations)
+            if (ks.t1 - ks.t0) < 0.30:
+                j += 1
+                continue
+
             # In a gap, only the neighboring whisper windows can overlap meaningfully
             if (
                 overlap(ks.t0, ks.t1, prev_w0, prev_w1)
@@ -1100,8 +1204,15 @@ def auto_merge_and_insert(
         pass
 
     # collapse obvious consecutive duplicates (anime-style spam repeats)
+    combined = merge_whisper_micro_lines(combined)
     combined = dedupe_consecutive_items(combined, window_s=1.5, short_len=10)
-    combined = polish_timing(combined)
+    combined = extend_end_by_text_length(combined)
+    combined = polish_timing(
+        combined,
+        max_dur_s=7.0,
+        max_hold_per_char_s=0.2,
+    )
+
     write_srt_items(combined, out_final_srt)
 
     if out_compare_log:

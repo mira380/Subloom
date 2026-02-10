@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -9,39 +10,69 @@ from merge_subs import run
 from settings import AUDIO_PRESETS, DEFAULT_AUDIO_PRESET, AUDIO_DEFAULTS
 
 
+# ------------------------------------------------------------
+# Config
+# ------------------------------------------------------------
+
+
 @dataclass
 class AudioConfig:
-    # Stream selection
     audio_stream: Optional[str] = None
     audio_auto: bool = True
-
-    # Health checks
     min_audio_sec: float = AUDIO_DEFAULTS.min_audio_sec
-
-    # Cleaning
     no_clean: bool = False
     preset: str = AUDIO_DEFAULTS.preset
     gain_db: float = AUDIO_DEFAULTS.gain_db
-
-    # Output format
     target_sr: int = AUDIO_DEFAULTS.target_sr
     target_ch: int = AUDIO_DEFAULTS.target_ch
-
-    # Stability knobs (anti-gap)
     use_dynaudnorm_in_extract: bool = AUDIO_DEFAULTS.use_dynaudnorm_in_extract
     extract_dynaudnorm: str = AUDIO_DEFAULTS.extract_dynaudnorm
     extract_resample: str = AUDIO_DEFAULTS.extract_resample
-
-    # Fallback probe settings
     fallback_probesize: str = AUDIO_DEFAULTS.fallback_probesize
     fallback_analyzeduration: str = AUDIO_DEFAULTS.fallback_analyzeduration
 
+    # RNNoise-style denoise via ffmpeg's arnndn filter
+    use_rnnoise: bool = True
+    rnnoise_model: Optional[str] = (
+        ""  # path to model file
+)
 
-def build_audio_filter(preset: str, gain_db: float = 0.0) -> str:
+
+# ------------------------------------------------------------
+# Utilities
+# ------------------------------------------------------------
+
+
+def ffmpeg_has_filter(name: str) -> bool:
+    try:
+        rr = run(["ffmpeg", "-hide_banner", "-filters"], check=True)
+        txt = (rr.stdout or "") + "\n" + (rr.stderr or "")
+        return name in txt
+    except Exception:
+        return False
+
+
+def build_audio_filter(
+    preset: str,
+    gain_db: float = 0.0,
+    *,
+    use_rnnoise: bool = False,
+    rnnoise_model: Optional[str] = None,
+) -> str:
     p = (preset or DEFAULT_AUDIO_PRESET).strip().lower()
     chain = AUDIO_PRESETS.get(p, AUDIO_PRESETS[DEFAULT_AUDIO_PRESET])
+
+    # Keep existing behavior: gain first
     if abs(gain_db) > 0.01:
         chain = f"volume={gain_db}dB,{chain}"
+
+    # RNNoise denoise first, then rest of chain
+    if use_rnnoise:
+        if rnnoise_model:
+            chain = f"arnndn=m='{rnnoise_model}':mix=0.55,{chain}"
+        else:
+            chain = f"arnndn=mix=0.55,{chain}"
+
     return chain
 
 
@@ -70,11 +101,26 @@ def _get_duration_sec(meta: dict) -> Optional[float]:
         return None
 
 
+def _safe_int(x, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+
+def _norm_lang(tag: str) -> str:
+    t = (tag or "").strip().lower()
+    if t in ("jp", "jpn", "ja-jp"):
+        return "ja"
+    return t
+
+
+# ------------------------------------------------------------
+# Audio track selection
+# ------------------------------------------------------------
+
+
 def pick_best_audio_map(input_path: Path) -> str:
-    """
-    Return mapping like '0:a:0' or '0:a:1'.
-    Heuristic: highest bitrate; break ties with channels, then sample rate.
-    """
     meta = _ffprobe_json(input_path)
     streams = meta.get("streams") or []
 
@@ -88,26 +134,54 @@ def pick_best_audio_map(input_path: Path) -> str:
     if not audio_ord:
         return "0:a:0"
 
-    def score(s: dict) -> tuple[int, int, int]:
-        br = s.get("bit_rate")
-        ch = s.get("channels")
-        sr = s.get("sample_rate")
-        try:
-            br_i = int(br) if br is not None else 0
-        except Exception:
-            br_i = 0
-        try:
-            ch_i = int(ch) if ch is not None else 0
-        except Exception:
-            ch_i = 0
-        try:
-            sr_i = int(sr) if sr is not None else 0
-        except Exception:
-            sr_i = 0
-        return (br_i, ch_i, sr_i)
+    def get_tags(s: dict) -> dict:
+        t = s.get("tags")
+        return t if isinstance(t, dict) else {}
+
+    def lang_of(s: dict) -> str:
+        tags = get_tags(s)
+        return _norm_lang(str(tags.get("language") or ""))
+
+    def title_of(s: dict) -> str:
+        tags = get_tags(s)
+        for k in ("title", "handler_name", "NAME", "name"):
+            v = tags.get(k)
+            if v:
+                return str(v)
+        return ""
+
+    def is_commentary(s: dict) -> bool:
+        t = (title_of(s) or "").lower()
+        return any(x in t for x in ("commentary", "director", "descriptive"))
+
+    def ch_score(ch: int) -> int:
+        if ch == 2:
+            return 30
+        if ch == 1:
+            return 25
+        if ch == 6:
+            return 5
+        return max(0, 20 - abs(ch - 2) * 3)
+
+    def score(s: dict) -> tuple[int, int, int, int]:
+        br_i = _safe_int(s.get("bit_rate"), 0)
+        sr_i = _safe_int(s.get("sample_rate"), 0)
+        ch_i = _safe_int(s.get("channels"), 0)
+
+        lang = lang_of(s)
+        lang_boost = 50 if lang == "ja" else 0
+        comm_penalty = -25 if is_commentary(s) else 0
+        ch_boost = ch_score(ch_i)
+
+        return (lang_boost, comm_penalty, ch_boost, br_i + sr_i)
 
     best_ordinal, _ = max(audio_ord, key=lambda t: score(t[1]))
     return f"0:a:{best_ordinal}"
+
+
+# ------------------------------------------------------------
+# Preflight check
+# ------------------------------------------------------------
 
 
 def wav_preflight_ok(
@@ -121,88 +195,69 @@ def wav_preflight_ok(
     if not wav_path.exists():
         return False, "wav missing"
 
-    try:
-        if wav_path.stat().st_size < 200_000:
-            return False, "wav too small (likely wrong/empty track)"
-    except Exception:
-        pass
-
     meta = _ffprobe_json(wav_path)
     dur = _get_duration_sec(meta)
-    if dur is None or dur <= 0.1:
-        return False, "wav duration missing/zero"
+    if dur is None or dur < min_sec:
+        return False, "wav too short"
 
-    if dur < min_sec:
-        return False, f"wav too short ({dur:.1f}s < {min_sec:.1f}s)"
+    # Silence check
+    try:
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-t",
+            "25",
+            "-i",
+            str(wav_path),
+            "-af",
+            "volumedetect",
+            "-f",
+            "null",
+            "-",
+        ]
+        rr = run(cmd, check=True)
+        st = rr.stderr or ""
+        m_mean = re.search(r"mean_volume:\s*(-?\d+(?:\.\d+)?)\s*dB", st)
+        m_max = re.search(r"max_volume:\s*(-?\d+(?:\.\d+)?)\s*dB", st)
 
-    if expected_sec and expected_sec > 60 and dur < expected_sec * 0.60:
-        return (
-            False,
-            f"wav much shorter than input ({dur:.1f}s vs ~{expected_sec:.1f}s)",
-        )
-
-    streams = meta.get("streams") or []
-    a0 = next((s for s in streams if s.get("codec_type") == "audio"), None)
-    if a0:
-        sr = str(a0.get("sample_rate") or "")
-        ch = a0.get("channels")
-        if sr and int(sr) != int(expected_sr):
-            return False, f"wav sample rate is {sr}, expected {expected_sr}"
-        if ch is not None and int(ch) != int(expected_ch):
-            return False, f"wav channels is {ch}, expected {expected_ch}"
+        if m_mean and m_max:
+            mean_db = float(m_mean.group(1))
+            max_db = float(m_max.group(1))
+            if mean_db <= -55.0 and max_db <= -40.0:
+                return False, "wav near-silent"
+    except Exception:
+        pass
 
     return True, "ok"
 
 
-def extract_audio_stable(
-    input_path: Path,
-    out_wav: Path,
-    *,
-    audio_stream: Optional[str],
-    audio_auto: bool,
-    min_audio_sec: float,
-    target_sr: int,
-    target_ch: int,
-    use_dynaudnorm: bool,
-    extract_resample: str,
-    extract_dynaudnorm: str,
-    fallback_probesize: str,
-    fallback_analyzeduration: str,
-) -> Path:
-    """
-    Extracts a 'raw' WAV with anti-gap timestamp handling.
-    """
+# ------------------------------------------------------------
+# Extraction + cleaning
+# ------------------------------------------------------------
+
+
+def extract_audio_stable(input_path: Path, out_wav: Path, cfg: AudioConfig) -> Path:
     out_wav.parent.mkdir(parents=True, exist_ok=True)
 
-    expected_sec: Optional[float]
-    try:
-        expected_sec = _get_duration_sec(_ffprobe_json(input_path))
-    except Exception:
-        expected_sec = None
-
-    if audio_stream:
-        map_sel = audio_stream
-    elif audio_auto:
+    if cfg.audio_stream:
+        map_sel = cfg.audio_stream
+    elif cfg.audio_auto:
         map_sel = pick_best_audio_map(input_path)
     else:
         map_sel = "0:a:0"
 
-    af = extract_resample
-    if use_dynaudnorm:
-        af = f"{af},{extract_dynaudnorm}"
+    af = cfg.extract_resample
+    if cfg.use_dynaudnorm_in_extract:
+        af = f"{af},{cfg.extract_dynaudnorm}"
 
-    cmd_extract = [
+    cmd = [
         "ffmpeg",
         "-hide_banner",
         "-loglevel",
         "error",
         "-y",
-        "-thread_queue_size",
-        "4096",
-        "-fflags",
-        "+genpts",
-        "-avoid_negative_ts",
-        "make_zero",
         "-i",
         str(input_path),
         "-map",
@@ -211,120 +266,26 @@ def extract_audio_stable(
         "-af",
         af,
         "-ac",
-        str(target_ch),
+        str(cfg.target_ch),
         "-ar",
-        str(target_sr),
+        str(cfg.target_sr),
         "-c:a",
         "pcm_s16le",
         str(out_wav),
     ]
-    run(cmd_extract, check=True)
+    run(cmd, check=True)
 
     ok, reason = wav_preflight_ok(
         out_wav,
-        min_sec=min_audio_sec,
-        expected_sec=expected_sec,
-        expected_sr=target_sr,
-        expected_ch=target_ch,
+        min_sec=cfg.min_audio_sec,
+        expected_sec=None,
+        expected_sr=cfg.target_sr,
+        expected_ch=cfg.target_ch,
     )
-    if ok:
-        return out_wav
-
-    bad = out_wav.with_suffix(".bad.wav")
-    try:
-        if bad.exists():
-            bad.unlink()
-        out_wav.replace(bad)
-    except Exception:
-        pass
-
-    print(
-        f"[subloom] audio preflight failed ({reason}) — retrying extraction (map {map_sel})"
-    )
-
-    cmd_extract_fallback = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-thread_queue_size",
-        "8192",
-        "-analyzeduration",
-        fallback_analyzeduration,
-        "-probesize",
-        fallback_probesize,
-        "-fflags",
-        "+genpts+igndts",
-        "-avoid_negative_ts",
-        "make_zero",
-        "-i",
-        str(input_path),
-        "-map",
-        map_sel,
-        "-vn",
-        "-af",
-        af,
-        "-ac",
-        str(target_ch),
-        "-ar",
-        str(target_sr),
-        "-c:a",
-        "pcm_s16le",
-        str(out_wav),
-    ]
-    run(cmd_extract_fallback, check=True)
-
-    ok2, reason2 = wav_preflight_ok(
-        out_wav,
-        min_sec=min_audio_sec,
-        expected_sec=expected_sec,
-        expected_sr=target_sr,
-        expected_ch=target_ch,
-    )
-    if not ok2:
-        raise RuntimeError(
-            "Audio extraction still looks broken after fallback.\n"
-            f"  input:  {input_path}\n"
-            f"  map:    {map_sel}\n"
-            f"  reason: {reason2}\n"
-            "Try: --audio-stream 0:a:1 (or another track)\n"
-        )
+    if not ok:
+        raise RuntimeError(f"Audio extraction failed: {reason}")
 
     return out_wav
-
-
-def clean_audio(
-    wav_path: Path,
-    *,
-    preset: str,
-    gain_db: float,
-    target_sr: int,
-    target_ch: int,
-) -> Path:
-    clean_wav = wav_path.with_suffix(".clean.wav")
-    af = build_audio_filter(preset=preset, gain_db=gain_db)
-
-    cmd_clean = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-i",
-        str(wav_path),
-        "-af",
-        af,
-        "-ac",
-        str(target_ch),
-        "-ar",
-        str(target_sr),
-        "-c:a",
-        "pcm_s16le",
-        str(clean_wav),
-    ]
-    run(cmd_clean, check=True)
-    return clean_wav
 
 
 def extract_and_clean_audio(
@@ -332,56 +293,56 @@ def extract_and_clean_audio(
     out_wav: Path,
     cfg: AudioConfig,
     *,
-    out_wav_stereo: Path | None = None,
+    out_wav_stereo: Optional[Path] = None,
 ) -> Path:
-    """
-    Compatibility wrapper used by subloom.py.
-    """
-    # Avoid double loudness normalization for anime / chaotic dialogue presets
-    use_extract_dyn = cfg.use_dynaudnorm_in_extract
-    if (cfg.preset or "").strip().lower() == "anime":
-        use_extract_dyn = False
-
-    raw = extract_audio_stable(
-        input_path,
-        out_wav,
-        audio_stream=cfg.audio_stream,
-        audio_auto=cfg.audio_auto,
-        min_audio_sec=cfg.min_audio_sec,
-        target_sr=cfg.target_sr,
-        target_ch=cfg.target_ch,
-        use_dynaudnorm=use_extract_dyn,
-        extract_resample=cfg.extract_resample,
-        extract_dynaudnorm=cfg.extract_dynaudnorm,
-        fallback_probesize=cfg.fallback_probesize,
-        fallback_analyzeduration=cfg.fallback_analyzeduration,
-    )
-
-    # Optional stereo clean wav (used only by rescue pass)
-    if out_wav_stereo is not None:
-        out_wav_stereo.parent.mkdir(parents=True, exist_ok=True)
-        extract_audio_stable(
-            input_path,
-            out_wav_stereo,
-            audio_stream=cfg.audio_stream,
-            audio_auto=cfg.audio_auto,
-            min_audio_sec=cfg.min_audio_sec,
-            target_sr=cfg.target_sr,
-            target_ch=2,
-            use_dynaudnorm=use_extract_dyn,
-            extract_resample=cfg.extract_resample,
-            extract_dynaudnorm=cfg.extract_dynaudnorm,
-            fallback_probesize=cfg.fallback_probesize,
-            fallback_analyzeduration=cfg.fallback_analyzeduration,
-        )
+    raw_wav = extract_audio_stable(input_path, out_wav, cfg)
 
     if cfg.no_clean:
-        return raw
+        return raw_wav
 
-    return clean_audio(
-        raw,
-        preset=cfg.preset,
-        gain_db=cfg.gain_db,
-        target_sr=cfg.target_sr,
-        target_ch=cfg.target_ch,
+    clean_wav = out_wav.with_name(out_wav.stem + ".clean.wav")
+
+    use_rn = bool(cfg.use_rnnoise) and ffmpeg_has_filter("arnndn")
+    af = build_audio_filter(
+        cfg.preset,
+        cfg.gain_db,
+        use_rnnoise=use_rn,
+        rnnoise_model=cfg.rnnoise_model,
     )
+
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(raw_wav),
+        "-af",
+        af,
+        "-ac",
+        str(cfg.target_ch),
+        "-ar",
+        str(cfg.target_sr),
+        str(clean_wav),
+    ]
+    run(cmd, check=True)
+
+    if out_wav_stereo:
+        cmd_stereo = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(raw_wav),
+            "-ac",
+            "2",
+            "-ar",
+            str(cfg.target_sr),
+            str(out_wav_stereo),
+        ]
+        run(cmd_stereo, check=True)
+
+    return clean_wav
