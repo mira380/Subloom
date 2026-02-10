@@ -23,6 +23,7 @@ Subloom is a fully local subtitle generator for audio and video.
 - Linux (Windows should work but not tested)
 - Python 3.10+
 - FFmpeg
+- RNNoise
 - whisper.cpp
 - An ASR engine
   - e.g. **Kotoba Whisper**
